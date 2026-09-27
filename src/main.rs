@@ -15,16 +15,11 @@ extern crate alloc;
 mod button;
 mod display;
 mod input;
-mod lora_interface;
 mod power;
 mod radio;
 
 use embassy_embedded_hal::shared_bus::asynch::{i2c::I2cDevice, spi::SpiDevice};
 use embassy_executor::Spawner;
-use lora_p2p_messenger::{
-    runtime::{self, APP_EVENTS, INBOUND_RADIO_MESSAGES, RADIO_COMMANDS, UI_SIGNAL},
-    web,
-};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, signal::Signal};
 use embassy_time::Timer;
 use esp_backtrace as _;
@@ -32,7 +27,6 @@ use esp_hal::{
     Async,
     gpio::{Input, InputConfig, Level, Output, OutputConfig},
     i2c::master::{Config as I2CConfig, I2c},
-    interrupt::software::SoftwareInterruptControl,
     spi::{
         Mode,
         master::{Config as SpiConfig, Spi},
@@ -41,6 +35,10 @@ use esp_hal::{
     timer::timg::TimerGroup,
 };
 use esp_println as _;
+use lora_p2p_messenger::{
+    runtime::{self, APP_EVENTS, INBOUND_RADIO_MESSAGES, RADIO_COMMANDS, UI_SIGNAL},
+    web,
+};
 use static_cell::StaticCell;
 
 static SPI_BUS: StaticCell<Mutex<CriticalSectionRawMutex, Spi<'static, Async>>> = StaticCell::new();
@@ -58,12 +56,10 @@ async fn main(spawner: Spawner) {
     defmt::info!("peripherals initialized");
     esp_alloc::heap_allocator!(size: 128 * 1024);
 
-    // set up software interrupt control and timer group, and start the esp_rtos executor
-    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
-    defmt::info!("software interrupt control initialized");
+    // Start the scheduler with the timer group and software interrupt peripheral.
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     defmt::info!("timer group initialized");
-    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+    esp_rtos::start(timg0.timer0, peripherals.FROM_CPU_INTR0);
     defmt::info!("esp_rtos started");
 
     // buttons
@@ -100,13 +96,7 @@ async fn main(spawner: Spawner) {
 
     let i2c_bus = I2C_BUS.init(Mutex::new(i2c));
 
-    spawner
-        .spawn(power::task(
-            I2cDevice::new(i2c_bus),
-            APP_EVENTS.sender(),
-            &PMU_DONE,
-        ))
-        .unwrap();
+    spawner.spawn(power::task(I2cDevice::new(i2c_bus), APP_EVENTS.sender(), &PMU_DONE).unwrap());
     PMU_DONE.wait().await;
     defmt::info!("power setup complete");
 
@@ -130,13 +120,9 @@ async fn main(spawner: Spawner) {
 
     // spawn the display task for user feedback
     defmt::info!("spawning app task");
-    spawner
-        .spawn(runtime::app_task(
-            APP_EVENTS.receiver(),
-            RADIO_COMMANDS.sender(),
-            &UI_SIGNAL,
-        ))
-        .unwrap();
+    spawner.spawn(
+        runtime::app_task(APP_EVENTS.receiver(), RADIO_COMMANDS.sender(), &UI_SIGNAL).unwrap(),
+    );
     defmt::info!("app task spawned");
 
     // setup wifi
@@ -147,16 +133,14 @@ async fn main(spawner: Spawner) {
     defmt::info!("wifi tasks spawned");
 
     defmt::info!("spawning input task");
-    spawner.spawn(input::task(boot_input, io3_input)).unwrap();
+    spawner.spawn(input::task(boot_input, io3_input).unwrap());
     defmt::info!("input task spawned");
     defmt::info!("spawning display task");
-    spawner
-        .spawn(display::display_task(I2cDevice::new(i2c_bus), &UI_SIGNAL))
-        .unwrap();
+    spawner.spawn(display::display_task(I2cDevice::new(i2c_bus), &UI_SIGNAL).unwrap());
     defmt::info!("display task spawned");
     defmt::info!("spawning radio task");
-    spawner
-        .spawn(radio::task(
+    spawner.spawn(
+        radio::task(
             lora_rst,
             ldo_en,
             ctl_lna,
@@ -166,8 +150,9 @@ async fn main(spawner: Spawner) {
             RADIO_COMMANDS.receiver(),
             INBOUND_RADIO_MESSAGES.dyn_immediate_publisher(),
             APP_EVENTS.sender(),
-        ))
-        .unwrap();
+        )
+        .unwrap(),
+    );
     defmt::info!("radio task spawned");
 
     loop {

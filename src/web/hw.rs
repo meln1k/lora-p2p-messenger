@@ -4,18 +4,18 @@ use defmt::{info, warn};
 use embassy_executor::Spawner;
 use embassy_net::{Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Sender};
-use esp_hal::{efuse::Efuse, rng::Rng};
+use esp_hal::{efuse, rng::Rng};
 use heapless::String;
 
 use super::{
-    AP_IP,
-    derive_ap_password_from,
-    derive_ap_ssid_from,
-    network,
-    server,
+    AP_IP, clients::MAX_CLIENTS, derive_ap_password_from, derive_ap_ssid_from, network, server,
     set_ap_credentials,
 };
 use crate::events::Event;
+
+// One TCP socket per HTTP worker, one DHCP socket and one DNS socket allocated
+// by embassy-net's enabled DNS feature.
+const NETWORK_SOCKETS: usize = server::HTTP_CONNECTIONS + 2;
 
 const DEFAULT_AP_PASSWORD_SEED: &str = "tbeam-dev-seed";
 
@@ -52,10 +52,22 @@ pub fn spawn_wifi_tasks(
         password.len()
     );
 
-    let (controller, interfaces) =
-        esp_radio::wifi::new(wifi, Default::default()).map_err(|_| ())?;
+    let ap_config = esp_radio::wifi::Config::AccessPoint(
+        esp_radio::wifi::ap::AccessPointConfig::default()
+            .with_max_connections(MAX_CLIENTS as u16)
+            .with_ssid(ssid.as_str().try_into().map_err(|_| ())?)
+            .with_authentication(esp_radio::wifi::AuthenticationMethodConfig::Wpa2Personal(
+                password.as_str().try_into().map_err(|_| ())?,
+            )),
+    );
+    // Creating the controller now applies the configuration and starts Wi-Fi.
+    let controller = esp_radio::wifi::WifiController::new(
+        wifi,
+        esp_radio::wifi::ControllerConfig::default().with_initial_config(ap_config.clone()),
+    )
+    .map_err(|_| ())?;
     info!("web: WiFi driver initialized");
-    let device = interfaces.access_point;
+    let device = esp_radio::wifi::Interface::access_point();
 
     let gw_ip_addr = Ipv4Addr::from_str(AP_IP).unwrap();
     let config = embassy_net::Config::ipv4_static(StaticConfigV4 {
@@ -68,32 +80,38 @@ pub fn spawn_wifi_tasks(
     let (stack, runner) = embassy_net::new(
         device,
         config,
-        mk_static!(StackResources<5>, StackResources::<5>::new()),
+        mk_static!(
+            StackResources<NETWORK_SOCKETS>,
+            StackResources::<NETWORK_SOCKETS>::new()
+        ),
         seed,
     );
     info!("web: embassy-net stack initialized");
 
     info!("web: spawning WiFi connection task");
-    spawner
-        .spawn(network::connection_task(
-            controller, ssid, password, app_events,
-        ))
-        .map_err(|_| ())?;
+    spawner.spawn(network::connection_task(controller, ap_config, app_events).map_err(|_| ())?);
     info!("web: spawning net runner task");
-    spawner.spawn(network::net_task(runner)).map_err(|_| ())?;
+    spawner.spawn(network::net_task(runner).map_err(|_| ())?);
     info!("web: spawning DHCP server task");
-    spawner.spawn(network::dhcp_task(stack)).map_err(|_| ())?;
-    info!("web: spawning HTTP server task");
-    spawner
-        .spawn(server::http_server_task(stack))
-        .map_err(|_| ())?;
+    spawner.spawn(network::dhcp_task(stack).map_err(|_| ())?);
+    info!("web: spawning radio message collector");
+    spawner.spawn(server::radio_message_task().map_err(|_| ())?);
+    info!("web: spawning {} HTTP workers", server::HTTP_CONNECTIONS);
+    for _ in 0..server::HTTP_CONNECTIONS {
+        spawner.spawn(server::http_server_task(stack).map_err(|_| ())?);
+    }
     info!("web: all WiFi tasks spawned");
 
     Ok(())
 }
 
 fn derive_ap_ssid() -> String<8> {
-    derive_ap_ssid_from(Efuse::mac_address())
+    derive_ap_ssid_from(
+        efuse::base_mac_address()
+            .as_bytes()
+            .try_into()
+            .expect("six-byte MAC address"),
+    )
 }
 
 fn derive_ap_password() -> String<32> {
@@ -101,7 +119,13 @@ fn derive_ap_password() -> String<32> {
         warn!("web: AP_PASSWORD_SEED unset, using default seed");
     }
 
-    derive_ap_password_from(Efuse::mac_address(), ap_password_seed())
+    derive_ap_password_from(
+        efuse::base_mac_address()
+            .as_bytes()
+            .try_into()
+            .expect("six-byte MAC address"),
+        ap_password_seed(),
+    )
 }
 
 fn ap_password_seed() -> &'static str {

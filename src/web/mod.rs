@@ -3,6 +3,8 @@ use core::cell::RefCell;
 use embassy_sync::blocking_mutex::{Mutex, raw::CriticalSectionRawMutex};
 use heapless::String;
 
+#[cfg(any(target_arch = "xtensa", test))]
+mod clients;
 #[cfg(target_arch = "xtensa")]
 mod hw;
 #[cfg(target_arch = "xtensa")]

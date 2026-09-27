@@ -14,95 +14,86 @@ use embassy_net::{Runner, Stack};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Sender};
 use embassy_time::{Duration, Timer};
 use esp_radio::wifi::{
-    AuthenticationMethod,
-    ModeConfig,
-    WifiController,
-    WifiDevice,
-    WifiEvent,
-    ap::AccessPointConfig,
+    Config, Interface, WifiController,
+    event::{EventInfo, MessageResult},
 };
-use heapless::String;
 
-use super::AP_IP;
+use super::{AP_IP, clients::ConnectedClients};
 use crate::events::Event;
 
 #[embassy_executor::task]
-pub(crate) async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+pub(crate) async fn net_task(mut runner: Runner<'static, Interface>) {
     runner.run().await
 }
 
 #[embassy_executor::task]
 pub(crate) async fn connection_task(
     mut controller: WifiController<'static>,
-    ap_ssid: String<8>,
-    ap_password: String<32>,
+    ap_config: Config,
     app_events: Sender<'static, CriticalSectionRawMutex, Event, 8>,
 ) {
     info!("web: connection task started");
-    let mut client_connected = false;
+    let mut clients = ConnectedClients::default();
 
     loop {
-        if !matches!(controller.is_started(), Ok(true)) {
-            info!("web: AP stopped, configuring and starting AP");
-            let ap_cfg = ModeConfig::AccessPoint(
-                AccessPointConfig::default()
-                    .with_ssid(ap_ssid.as_str().into())
-                    .with_auth_method(AuthenticationMethod::Wpa2Personal)
-                    .with_password(ap_password.as_str().into()),
-            );
-            if controller.set_config(&ap_cfg).is_err() {
-                warn!("web: failed to set AP config");
+        // Keep a subscription alive so events are retained while app events are sent.
+        {
+            let mut events = controller
+                .subscribe()
+                .expect("Wi-Fi event subscription failed");
+            loop {
+                let event = match events.next_event().await {
+                    MessageResult::Message(event) => event,
+                    MessageResult::Lagged(missed) => {
+                        // There is no public AP client-list query to rebuild our state.
+                        warn!(
+                            "web: missed {} Wi-Fi events; client state may be stale",
+                            missed
+                        );
+                        continue;
+                    }
+                };
+                let was_connected = clients.any_connected();
+                match event {
+                    EventInfo::AccessPointStationConnected { mac, .. } => {
+                        if clients.join(mac).is_err() {
+                            warn!("web: AP client tracking full; client state may be stale");
+                        }
+                        info!("web: AP client joined: {=[u8; 6]:x}", mac);
+                    }
+                    EventInfo::AccessPointStationDisconnected { mac, reason, .. } => {
+                        clients.leave(mac);
+                        info!("web: AP client left: {=[u8; 6]:x}, reason={}", mac, reason);
+                    }
+                    EventInfo::AccessPointStop => {
+                        warn!("web: AP stop event observed");
+                        break;
+                    }
+                    _ => continue,
+                };
+                let connected = clients.any_connected();
+                if connected != was_connected {
+                    app_events
+                        .send(Event::WifiClientConnectionChanged { connected })
+                        .await;
+                }
             }
-            if controller.start_async().await.is_err() {
-                warn!("web: failed to start AP");
-            } else {
-                info!("web: AP start requested");
-            }
-            if client_connected {
-                client_connected = false;
-                app_events
-                    .send(Event::WifiClientConnectionChanged { connected: false })
-                    .await;
-            }
-        } else {
-            debug!("web: waiting for AP station-connect/disconnect or stop event");
-            let events = controller
-                .wait_for_events(
-                    WifiEvent::AccessPointStationConnected
-                        | WifiEvent::AccessPointStationDisconnected
-                        | WifiEvent::AccessPointStop,
-                    true,
-                )
-                .await;
+        }
 
-            if events.contains(WifiEvent::AccessPointStationConnected) {
-                info!("web: AP client joined");
-                if !client_connected {
-                    client_connected = true;
-                    app_events
-                        .send(Event::WifiClientConnectionChanged { connected: true })
-                        .await;
-                }
+        if clients.any_connected() {
+            clients.clear();
+            app_events
+                .send(Event::WifiClientConnectionChanged { connected: false })
+                .await;
+        }
+        // set_config replaces the old separate configure/start calls.
+        loop {
+            Timer::after(Duration::from_secs(1)).await;
+            if controller.set_config(&ap_config).is_ok() {
+                info!("web: AP restarted");
+                break;
             }
-            if events.contains(WifiEvent::AccessPointStationDisconnected) {
-                info!("web: AP client left");
-                if client_connected {
-                    client_connected = false;
-                    app_events
-                        .send(Event::WifiClientConnectionChanged { connected: false })
-                        .await;
-                }
-            }
-            if events.contains(WifiEvent::AccessPointStop) {
-                warn!("web: AP stop event observed");
-                if client_connected {
-                    client_connected = false;
-                    app_events
-                        .send(Event::WifiClientConnectionChanged { connected: false })
-                        .await;
-                }
-                Timer::after(Duration::from_millis(1000)).await;
-            }
+            warn!("web: failed to restart AP");
         }
     }
 }

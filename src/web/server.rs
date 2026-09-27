@@ -6,22 +6,20 @@ use defmt::{debug, info, warn};
 use embassy_net::{IpListenEndpoint, Stack, tcp::TcpSocket};
 use embassy_sync::{
     blocking_mutex::{Mutex as BlockingMutex, raw::CriticalSectionRawMutex},
-    pubsub::{DynSubscriber, WaitResult},
+    pubsub::WaitResult,
 };
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, with_timeout};
 use heapless::{String, Vec};
 
 use super::{AP_PORT, ap_password, ap_ssid, ap_url};
 use crate::{
-    messages::{
-        InboundRadioMessage,
-        MAX_LOG_ENTRIES,
-        MAX_MESSAGE_LEN,
-        MessageDirection,
-        MessageEntry,
-    },
+    messages::{MAX_LOG_ENTRIES, MAX_MESSAGE_LEN, MessageDirection, MessageEntry},
     runtime::{INBOUND_RADIO_MESSAGES, MESSAGE_LOG, OUTBOUND_MESSAGES, log_received, log_sent},
 };
+
+// Each worker owns its socket, request and response buffers in static task storage.
+pub(crate) const HTTP_CONNECTIONS: usize = 4;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 const INDEX_HTML: &str = include_str!("index.html");
 
@@ -51,19 +49,15 @@ struct RequestMeta<'a> {
     last_event_id: Option<u32>,
 }
 
-#[embassy_executor::task]
+#[embassy_executor::task(pool_size = HTTP_CONNECTIONS)]
 pub(crate) async fn http_server_task(stack: Stack<'static>) {
     info!(
         "web: HTTP server task started at {}:{}",
         super::AP_IP,
         AP_PORT
     );
-    let mut inbound_sub = INBOUND_RADIO_MESSAGES
-        .dyn_subscriber()
-        .expect("inbound pubsub subscriber unavailable");
-
-    let mut rx_buffer = [0; 2048];
-    let mut tx_buffer = [0; 6144];
+    let mut rx_buffer = [0; 1024];
+    let mut tx_buffer = [0; 1536];
     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
     socket.set_timeout(Some(Duration::from_secs(15)));
 
@@ -86,17 +80,22 @@ pub(crate) async fn http_server_task(stack: Stack<'static>) {
             continue;
         }
 
-        handle_one_http_request(&mut socket, &mut inbound_sub).await;
+        // Bound the whole request, including a peer that keeps sending slowly.
+        if with_timeout(REQUEST_TIMEOUT, handle_one_http_request(&mut socket))
+            .await
+            .is_err()
+        {
+            warn!("web: HTTP request timed out");
+            socket.abort();
+            continue;
+        }
         socket.close();
         Timer::after(Duration::from_millis(20)).await;
         socket.abort();
     }
 }
 
-async fn handle_one_http_request(
-    socket: &mut TcpSocket<'_>,
-    inbound_sub: &mut DynSubscriber<'static, InboundRadioMessage>,
-) {
+async fn handle_one_http_request(socket: &mut TcpSocket<'_>) {
     let mut req = [0u8; 2048];
     let mut total = 0usize;
     let mut header_end = None;
@@ -147,7 +146,6 @@ async fn handle_one_http_request(
             let _ = write_response(socket, "200 OK", "application/json", body.as_bytes()).await;
         }
         (HttpMethod::Get, "/api/messages") => {
-            drain_inbound_messages(inbound_sub).await;
             let snapshot = {
                 let log = MESSAGE_LOG.lock().await;
                 log.snapshot()
@@ -156,7 +154,7 @@ async fn handle_one_http_request(
             let _ = write_response(socket, "200 OK", "application/json", body.as_bytes()).await;
         }
         (HttpMethod::Get, "/events") => {
-            let _ = handle_sse(socket, inbound_sub, meta.last_event_id).await;
+            let _ = handle_sse(socket, meta.last_event_id).await;
         }
         (HttpMethod::Post, "/api/send") => {
             if enqueue_outbound_message(meta.body).await {
@@ -171,13 +169,7 @@ async fn handle_one_http_request(
     }
 }
 
-async fn handle_sse(
-    socket: &mut TcpSocket<'_>,
-    inbound_sub: &mut DynSubscriber<'static, InboundRadioMessage>,
-    last_event_id: Option<u32>,
-) -> Result<(), ()> {
-    drain_inbound_messages(inbound_sub).await;
-
+async fn handle_sse(socket: &mut TcpSocket<'_>, last_event_id: Option<u32>) -> Result<(), ()> {
     let Some(last_id) = last_event_id else {
         let snapshot = {
             let log = MESSAGE_LOG.lock().await;
@@ -206,7 +198,6 @@ async fn handle_sse(
             return write_sse_response(socket, seq, payload.as_str()).await;
         }
 
-        drain_inbound_messages(inbound_sub).await;
         Timer::after(Duration::from_millis(50)).await;
     }
 
@@ -242,16 +233,23 @@ async fn enqueue_outbound_message(body: &[u8]) -> bool {
     true
 }
 
-async fn drain_inbound_messages(subscriber: &mut DynSubscriber<'static, InboundRadioMessage>) {
-    while let Some(msg) = subscriber.try_next_message() {
-        match msg {
+/// A single subscriber owns ingestion; HTTP workers only read the shared log.
+#[embassy_executor::task]
+pub(crate) async fn radio_message_task() {
+    let mut subscriber = INBOUND_RADIO_MESSAGES
+        .dyn_subscriber()
+        .expect("inbound pubsub subscriber unavailable");
+    loop {
+        match subscriber.next_message().await {
             WaitResult::Message(msg) => {
                 log_received(msg.payload.as_slice(), msg.rssi, msg.snr).await;
                 let entry = inbound_to_entry(msg.payload.as_slice(), msg.rssi, msg.snr);
                 let seq = note_append(&entry);
                 debug!("web: log append seq={}", seq);
             }
-            WaitResult::Lagged(_) => continue,
+            WaitResult::Lagged(missed) => {
+                warn!("web: missed {} inbound radio messages", missed);
+            }
         }
     }
 }
@@ -306,8 +304,16 @@ async fn write_response(
     content_type: &str,
     body: &[u8],
 ) -> Result<(), ()> {
-    use embedded_io_async::Write;
+    write_response_parts(socket, status, content_type, &[body]).await
+}
 
+// Write fragments directly, avoiding a second full-sized copy of SSE payloads.
+async fn write_response_parts<W: embedded_io_async::Write>(
+    socket: &mut W,
+    status: &str,
+    content_type: &str,
+    parts: &[&[u8]],
+) -> Result<(), ()> {
     let mut header = String::<192>::new();
     let _ = core::fmt::write(
         &mut header,
@@ -315,32 +321,31 @@ async fn write_response(
             "HTTP/1.1 {}\r\nContent-Type: {}\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             status,
             content_type,
-            body.len(),
+            parts.iter().map(|part| part.len()).sum::<usize>(),
         ),
     );
 
     socket.write_all(header.as_bytes()).await.map_err(|_| ())?;
-    socket.write_all(body).await.map_err(|_| ())?;
+    for part in parts {
+        socket.write_all(part).await.map_err(|_| ())?;
+    }
     socket.flush().await.map_err(|_| ())?;
     Ok(())
 }
 
-async fn write_sse_response(
-    socket: &mut TcpSocket<'_>,
+async fn write_sse_response<W: embedded_io_async::Write>(
+    socket: &mut W,
     id: u32,
     json_payload: &str,
 ) -> Result<(), ()> {
-    let mut body = String::<4608>::new();
-    let _ = core::fmt::write(
-        &mut body,
-        format_args!("retry: 1000\nid: {}\ndata: {}\n\n", id, json_payload),
-    );
-
-    write_response(
+    let mut prefix = String::<48>::new();
+    core::fmt::write(&mut prefix, format_args!("retry: 1000\nid: {}\ndata: ", id))
+        .map_err(|_| ())?;
+    write_response_parts(
         socket,
         "200 OK",
         "text/event-stream; charset=utf-8",
-        body.as_bytes(),
+        &[prefix.as_bytes(), json_payload.as_bytes(), b"\n\n"],
     )
     .await
 }
@@ -567,6 +572,75 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct PartialWriter {
+        bytes: std::vec::Vec<u8>,
+        pending: bool,
+    }
+
+    impl embedded_io_async::ErrorType for PartialWriter {
+        type Error = core::convert::Infallible;
+    }
+
+    impl embedded_io_async::Write for PartialWriter {
+        async fn write(&mut self, bytes: &[u8]) -> Result<usize, Self::Error> {
+            // Force both responses to suspend and interleave, with short writes.
+            core::future::poll_fn(|cx| {
+                self.pending = !self.pending;
+                if self.pending {
+                    cx.waker().wake_by_ref();
+                    core::task::Poll::Pending
+                } else {
+                    let len = bytes.len().min(7);
+                    self.bytes.extend_from_slice(&bytes[..len]);
+                    core::task::Poll::Ready(Ok(len))
+                }
+            })
+            .await
+        }
+
+        async fn flush(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn concurrent_sse_responses_preserve_framing_and_full_payloads() {
+        use core::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let mut first = PartialWriter::default();
+        let mut second = PartialWriter::default();
+        let payload = "x".repeat(4608);
+        {
+            let responses = embassy_futures::join::join(
+                write_sse_response(&mut first, 7, &payload),
+                write_sse_response(&mut second, 8, "{}"),
+            );
+            let mut responses = core::pin::pin!(responses);
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut complete = false;
+            for _ in 0..10_000 {
+                if let Poll::Ready(result) = responses.as_mut().poll(&mut cx) {
+                    assert_eq!(result, (Ok(()), Ok(())));
+                    complete = true;
+                    break;
+                }
+            }
+            assert!(complete, "responses must make independent progress");
+        }
+        for (writer, id, payload) in [(first, 7, payload.as_str()), (second, 8, "{}")] {
+            let response = std::str::from_utf8(&writer.bytes).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            assert_eq!(
+                body,
+                std::format!("retry: 1000\nid: {id}\ndata: {payload}\n\n")
+            );
+            assert!(headers.contains(&std::format!("Content-Length: {}\r\n", body.len())));
+        }
+    }
 
     fn rx_entry(text: &str, rssi: i16, snr: i16) -> MessageEntry {
         let mut msg = String::<MAX_MESSAGE_LEN>::new();

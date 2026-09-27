@@ -22,12 +22,11 @@ use esp_hal::{
 use lora_phy::{
     LoRa,
     RxMode,
+    iv::GenericSx127xInterfaceVariant,
     mod_params::{Bandwidth, CodingRate, SpreadingFactor},
     sx127x,
     sx127x::{Sx127x, Sx1276},
 };
-
-use crate::lora_interface::TBeamSx127xInterfaceVariant;
 
 const OUTPUT_POWER: i32 = 10;
 const ULTRA_RX_LEN: u8 = 2;
@@ -64,8 +63,15 @@ pub async fn task(
         rx_boost: false,
     };
 
-    let iv = TBeamSx127xInterfaceVariant::new(lora_rst, lora_dio0, lora_dio1, Some(ctl_lna), None)
-        .unwrap();
+    // DIO1 carries RxTimeout, so single-shot receive must watch both IRQ pins.
+    let iv = GenericSx127xInterfaceVariant::new_with_secondary_irq(
+        lora_rst,
+        lora_dio0,
+        Some(lora_dio1),
+        Some(ctl_lna),
+        None,
+    )
+    .unwrap();
 
     let mut lora = LoRa::with_syncword(
         Sx127x::new(spi_device, iv, sx127x_config),

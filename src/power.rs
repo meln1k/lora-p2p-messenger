@@ -1,12 +1,10 @@
 use axp2101_dd::{Axp2101Async, AxpError, AxpInterface, LdoId};
 use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
-use lora_p2p_messenger::events::Event;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Sender, signal::Signal};
 use embassy_time::{Duration, Ticker};
 use embedded_hal_async::i2c::I2c as AsyncI2c;
 use esp_hal::{Async, i2c::master::I2c};
-
-const TYPE_A: u8 = 0b00;
+use lora_p2p_messenger::events::Event;
 
 async fn setup_pmu<I2C>(
     i2c: I2C,
@@ -55,7 +53,7 @@ where
         .chg_led_control()
         .modify_async(|w| {
             w.set_chgled_en(true);
-            w.set_chgled_func(TYPE_A);
+            w.set_chgled_func(axp2101_dd::ChgledFunction::TypeA);
         })
         .await?;
 
