@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>T-Beam LoRa Chat</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 16px; }
+    form { display: flex; gap: 8px; margin: 12px 0; }
+    input { flex: 1; padding: 8px; }
+    button { padding: 8px 12px; }
+    li { margin: 6px 0; }
+    small { color: #666; }
+    .meta { margin: 8px 0; }
+    .status { min-height: 1.2em; color: #444; }
+  </style>
+</head>
+<body>
+  <h1>T-Beam LoRa Chat</h1>
+
+  <p class="meta">
+    AP: <b id="ap-ssid">...</b>
+    | PASS: <b id="ap-password">...</b>
+    | URL: <a id="ap-url" href="#">...</a>
+  </p>
+
+  <form id="send-form">
+    <input id="msg" name="msg" maxlength="64" placeholder="Type message" required>
+    <button type="submit">Send</button>
+  </form>
+  <div id="status" class="status"></div>
+
+  <ol id="messages"></ol>
+
+  <script>
+    const messagesEl = document.getElementById('messages');
+    const statusEl = document.getElementById('status');
+    const formEl = document.getElementById('send-form');
+    const msgEl = document.getElementById('msg');
+    const MAX_ENTRIES = 24;
+    let gotSnapshot = false;
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function renderEntry(entry) {
+      const li = document.createElement('li');
+      const head = document.createElement('b');
+      head.textContent = `${entry.direction}:`;
+      li.appendChild(head);
+      li.appendChild(document.createTextNode(` ${entry.text}`));
+
+      if (entry.rssi !== null && entry.snr !== null) {
+        const meta = document.createElement('small');
+        meta.textContent = ` (rssi ${entry.rssi}, snr ${entry.snr})`;
+        li.appendChild(meta);
+      }
+
+      return li;
+    }
+
+    function renderSnapshot(entries) {
+      messagesEl.innerHTML = '';
+      for (const entry of entries) {
+        messagesEl.appendChild(renderEntry(entry));
+      }
+    }
+
+    function appendEntry(entry) {
+      messagesEl.appendChild(renderEntry(entry));
+      while (messagesEl.children.length > MAX_ENTRIES) {
+        messagesEl.removeChild(messagesEl.firstChild);
+      }
+    }
+
+    async function fetchInfo() {
+      const response = await fetch('/api/info', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`info HTTP ${response.status}`);
+      const info = await response.json();
+
+      document.getElementById('ap-ssid').textContent = info.ssid;
+      document.getElementById('ap-password').textContent = info.password;
+      const apUrl = document.getElementById('ap-url');
+      apUrl.href = info.url;
+      apUrl.textContent = info.url;
+    }
+
+    async function sendMessage(message) {
+      const body = new URLSearchParams({ msg: message });
+      const response = await fetch('/api/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      });
+
+      if (!response.ok) {
+        throw new Error(`send HTTP ${response.status}`);
+      }
+    }
+
+    async function fetchSnapshotFallback() {
+      const response = await fetch('/api/messages', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`messages HTTP ${response.status}`);
+      const payload = await response.json();
+      if (Array.isArray(payload.entries)) {
+        renderSnapshot(payload.entries);
+      }
+    }
+
+    function startSse() {
+      const stream = new EventSource('/events');
+      stream.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.type === 'snapshot' && Array.isArray(payload.entries)) {
+            gotSnapshot = true;
+            renderSnapshot(payload.entries);
+          } else if (payload.type === 'append' && payload.entry) {
+            appendEntry(payload.entry);
+          }
+        } catch (err) {
+          setStatus(`Stream parse error: ${err.message}`);
+        }
+      };
+      stream.onerror = () => {
+        // EventSource reconnects automatically; keep status unchanged on transient errors.
+      };
+      stream.onopen = () => {
+        setStatus('Connected');
+      };
+
+      // If SSE is slow or blocked, populate initial state once via API.
+      setTimeout(() => {
+        if (!gotSnapshot) {
+          fetchSnapshotFallback().catch((err) => {
+            setStatus(`Snapshot error: ${err.message}`);
+          });
+        }
+      }, 2500);
+    }
+
+    formEl.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const message = msgEl.value.trim();
+      if (!message) return;
+
+      setStatus('Sending...');
+      try {
+        await sendMessage(message);
+        msgEl.value = '';
+        setStatus('Sent');
+      } catch (err) {
+        setStatus(`Send error: ${err.message}`);
+      }
+    });
+
+    (async () => {
+      try {
+        await fetchInfo();
+      } catch (err) {
+        setStatus(`Init error: ${err.message}`);
+      }
+      startSse();
+    })();
+  </script>
+</body>
+</html>
